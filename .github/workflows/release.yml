@@ -1,0 +1,118 @@
+name: Build and publish Windows preview
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daylight-release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[skip release]'))
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          architecture: x64
+      - name: Get the full license for the exact bundled Node version
+        id: runtime
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $nodePath = (Get-Command node.exe -CommandType Application).Source
+          $nodeVersion = (& $nodePath --version).Trim()
+          if ($LASTEXITCODE -ne 0 -or $nodeVersion -notmatch '^v\d+\.\d+\.\d+$') {
+            throw 'Unable to identify the installed Node runtime.'
+          }
+          $license = Join-Path $env:RUNNER_TEMP 'node-LICENSE.txt'
+          Invoke-WebRequest -UseBasicParsing -Uri ('https://raw.githubusercontent.com/nodejs/node/' + $nodeVersion + '/LICENSE') -OutFile $license
+          $licenseText = [IO.File]::ReadAllText($license)
+          if ($licenseText.Length -lt 10000 -or $licenseText -notmatch 'Node.js is licensed') {
+            throw 'The Node license download is incomplete.'
+          }
+          ('node_path=' + $nodePath) | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          ('license_path=' + $license) | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      - name: Run release checks and create verified source and portable archives
+        id: build
+        shell: powershell
+        env:
+          NODE_PATH_FOR_BUILD: ${{ steps.runtime.outputs.node_path }}
+          NODE_LICENSE_FOR_BUILD: ${{ steps.runtime.outputs.license_path }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $release = & .\scripts\release.ps1 -RuntimePath $env:NODE_PATH_FOR_BUILD -RuntimeLicensePath $env:NODE_LICENSE_FOR_BUILD -CommitRef $env:GITHUB_SHA -PassThru
+          if (-not $release.sourceZip -or -not $release.portableZip -or -not $release.checksumsPath -or -not $release.manifestPath) {
+            throw 'Release script did not return all required artifacts.'
+          }
+          foreach ($file in @($release.sourceZip, $release.portableZip, $release.checksumsPath, $release.manifestPath)) {
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw ('Missing artifact: ' + $file) }
+          }
+          ('source_zip=' + $release.sourceZip) | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          ('portable_zip=' + $release.portableZip) | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          ('checksums=' + $release.checksumsPath) | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          ('manifest=' + $release.manifestPath) | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          ('version=' + $release.version) | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      - name: Save build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-daylight-${{ steps.build.outputs.version }}
+          path: |
+            ${{ steps.build.outputs.source_zip }}
+            ${{ steps.build.outputs.portable_zip }}
+            ${{ steps.build.outputs.checksums }}
+            ${{ steps.build.outputs.manifest }}
+          if-no-files-found: error
+          retention-days: 90
+      - name: Publish a new preview without replacing an existing version
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DAYLIGHT_VERSION: ${{ steps.build.outputs.version }}
+          SOURCE_ZIP: ${{ steps.build.outputs.source_zip }}
+          PORTABLE_ZIP: ${{ steps.build.outputs.portable_zip }}
+          CHECKSUMS: ${{ steps.build.outputs.checksums }}
+          BUILD_MANIFEST: ${{ steps.build.outputs.manifest }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = 'v' + $env:DAYLIGHT_VERSION
+          $ErrorActionPreference = 'Continue'
+          $existing = & gh release view $tag --repo $env:GITHUB_REPOSITORY --json url --jq .url 2>$null
+          $releaseProbeExit = $LASTEXITCODE
+          $tagCommit = & git rev-parse --verify --quiet ($tag + '^{commit}') 2>$null
+          $tagProbeExit = $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+          if ($releaseProbeExit -eq 0) {
+            ('Existing release preserved: ' + $existing) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+            Write-Host ('Release ' + $tag + ' already exists; its tag and assets were not changed.')
+            exit 0
+          }
+          if ($tagProbeExit -eq 0 -and $tagCommit.Trim() -ne $env:GITHUB_SHA) {
+            throw 'This version tag already points to another commit. Increment package.json and CHANGELOG.md instead of replacing it.'
+          }
+          $notes = Join-Path $env:RUNNER_TEMP 'daylight-release-notes.md'
+          $changelog = [IO.File]::ReadAllText((Join-Path $env:GITHUB_WORKSPACE 'CHANGELOG.md'))
+          $pattern = '(?ms)^##\s+(?:\[)?' + [regex]::Escape($env:DAYLIGHT_VERSION) + '(?:\])?[^\r\n]*\r?\n(.*?)(?=^##\s|\z)'
+          $match = [regex]::Match($changelog, $pattern)
+          if (-not $match.Success) { throw 'Current version notes were not found in CHANGELOG.md.' }
+          $body = 'Codex 白昼 ' + $tag + ' · Windows 预览版' + [Environment]::NewLine + [Environment]::NewLine +
+            '下载 windows-x64.zip 并解压后运行 launch.cmd。便携包内含 Node.js，仍需本机安装 Codex 并通过 ChatGPT 登录。定时激活不能提前恢复或增加额度。' + [Environment]::NewLine + [Environment]::NewLine +
+            $match.Groups[1].Value.Trim() + [Environment]::NewLine + [Environment]::NewLine +
+            '构建提交：' + $env:GITHUB_SHA + [Environment]::NewLine + '请用 SHA256SUMS.txt 核对下载文件。'
+          [IO.File]::WriteAllText($notes, $body, (New-Object Text.UTF8Encoding($false)))
+          & gh release create $tag $env:SOURCE_ZIP $env:PORTABLE_ZIP $env:CHECKSUMS $env:BUILD_MANIFEST --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title ('Codex 白昼 ' + $tag + ' · Windows 预览') --notes-file $notes --prerelease
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub preview publication failed; build artifacts remain available in this run.' }
+          ('Published: https://github.com/' + $env:GITHUB_REPOSITORY + '/releases/tag/' + $tag) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append

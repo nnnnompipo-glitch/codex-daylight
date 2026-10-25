@@ -1,0 +1,15 @@
+{
+  "name": "codex-daylight",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Codex 白昼：Windows 本地额度监测与定时轻量激活工具",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test client.test.mjs core.test.mjs lifecycle.test.mjs worker.test.mjs scripts/release-core.test.mjs",
+    "check": "node worker.mjs --check",
+    "release": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release.ps1"
+  }
+}

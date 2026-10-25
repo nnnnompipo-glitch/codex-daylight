@@ -1,0 +1,7 @@
+* text=auto eol=lf
+*.ps1 text eol=lf
+*.cmd text eol=lf
+*.exe -text
+*.zip -text
+*.png -text
+templates/node-LICENSE.txt -whitespace

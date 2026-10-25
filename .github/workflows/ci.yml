@@ -1,0 +1,49 @@
+name: Verify Codex Daylight
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Node ${{ matrix.node }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: ['22', '24']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Run isolated tests without Codex or account credentials
+        run: node --test
+      - name: Verify native Windows interface without a model request
+        if: runner.os == 'Windows' && matrix.node == '24'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $screenshot = Join-Path $env:RUNNER_TEMP 'codex-daylight-ui.png'
+          $data = Join-Path $env:RUNNER_TEMP 'codex-daylight-ui-data'
+          powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\ui.ps1 -SmokeTest -DataDirectory $data -ScreenshotPath $screenshot
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $screenshot)) {
+            throw 'Native UI smoke test did not produce its screenshot.'
+          }
+      - name: Save native interface preview
+        if: runner.os == 'Windows' && matrix.node == '24'
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-ui-preview
+          path: ${{ runner.temp }}/codex-daylight-ui.png
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,9 @@
+dist/
+版本归档/
+runtime/
+local-data/
+private/
+node_modules/
+*.log
+*.tmp
+*.working
